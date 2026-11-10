@@ -1,0 +1,13 @@
+{
+  "title": "Fans",
+  "cpu": "CPU fan",
+  "gpu": "GPU fan",
+  "fanWithTemp": "%1 · %2",
+  "auto": "Auto",
+  "max": "Max",
+  "rpm": "%1 RPM",
+  "temp": "%1 °C",
+  "gpuSleeping": "GPU asleep",
+  "profile": "Power profile",
+  "noDriver": "No fan control driver found. See agent.md in the plugin folder."
+}

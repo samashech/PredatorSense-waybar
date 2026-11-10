@@ -1,0 +1,29 @@
+# System requirements for omarchy-predator-fans.
+# These are OS packages, not Python packages: do not run `pip install -r` on this file.
+# Names are Arch / CachyOS (pacman) first, Ubuntu (apt) after the "|".
+# agent.md explains which lines apply to which setup.
+
+## Always
+bash                      | bash
+coreutils                 | coreutils
+
+## Fan control driver (exactly ONE of these must provide fan control)
+# a) Mainline acer_wmi: ships with the kernel, nothing to install. Preferred.
+# b) Linuwu-Sense (https://github.com/0x7375646F/Linuwu-Sense), only if (a) exposes no fan control:
+git                       | git
+dkms                      | dkms
+base-devel                | build-essential
+<kernel>-headers          | linux-headers-$(uname -r)
+#   <kernel>-headers must match the running kernel: `pacman -Qo /usr/lib/modules/$(uname -r)`
+#   e.g. linux-headers, linux-zen-headers, linux-lts-headers, linux-cachyos-headers.
+
+## Optional features
+nvidia-utils              | nvidia-utils-<driver-version>   # GPU temperature (nvidia-smi)
+power-profiles-daemon     | power-profiles-daemon           # power profile buttons / right-click
+jq                        | jq                              # Waybar module only
+waybar                    | waybar                          # Waybar module only
+
+## Desktop
+# Omarchy:           the bar plugin runs inside omarchy-shell (`command -v omarchy-shell` must succeed). Nothing extra.
+#                    Older Omarchy releases that still use Waybar: use the Waybar module.
+# Hyprland/Sway/etc: use the Waybar module, or just the `predator-fanctl` CLI.

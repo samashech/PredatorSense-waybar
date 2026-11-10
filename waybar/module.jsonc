@@ -1,0 +1,12 @@
+// Add "custom/predator-fans" to modules-left, modules-center or modules-right
+// in your Waybar config, then paste this block next to the other module blocks.
+"custom/predator-fans": {
+  "exec": "$HOME/.local/bin/predator-fans-waybar",
+  "return-type": "json",
+  "interval": 5,
+  "signal": 9,
+  "on-click": "$HOME/.local/bin/predator-fanctl toggle; pkill -RTMIN+9 waybar",
+  "on-scroll-up": "$HOME/.local/bin/predator-fanctl bump +10; pkill -RTMIN+9 waybar",
+  "on-scroll-down": "$HOME/.local/bin/predator-fanctl bump -10; pkill -RTMIN+9 waybar",
+  "on-click-right": "$HOME/.local/bin/predator-fans-waybar profile; pkill -RTMIN+9 waybar"
+}

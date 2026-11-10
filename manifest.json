@@ -1,0 +1,17 @@
+{
+  "schemaVersion": 1,
+  "id": "samashech.fans",
+  "name": "Predator Fans",
+  "version": "1.1.0",
+  "author": "samashech",
+  "description": "Acer Predator / Nitro fan control: Auto, Max or a fixed speed per fan, live RPM, CPU and GPU temperature, and power profile",
+  "kinds": ["bar-widget"],
+  "entryPoints": { "barWidget": "Panel.qml" },
+  "barWidget": {
+    "displayName": "Predator Fans",
+    "description": "Control CPU and GPU fan speed without PredatorSense",
+    "category": "System",
+    "allowMultiple": false,
+    "defaultSection": "centerEnd"
+  }
+}

@@ -1,0 +1,127 @@
+#!/bin/bash
+# fanctl: read and set Acer Predator / Nitro fan speed.
+#
+#   fanctl status                       key<TAB>value lines (fans, temps, backend)
+#   fanctl set <1|2|all> auto           hand a fan back to the firmware curve
+#   fanctl set <1|2|all> manual <30-100>  fixed speed in percent
+#   fanctl max | fanctl auto            shortcuts for both fans
+#   fanctl toggle                       Auto -> Max -> Auto
+#   fanctl bump <+N|-N>                 nudge both fans (manual), e.g. for a scroll wheel
+#
+# Fan 1 is the CPU fan, fan 2 the GPU fan. Two driver backends are supported:
+#   hwmon  - mainline acer_wmi (or a fork such as facer): hwmon "acer" pwm1/pwm2
+#   linuwu - Linuwu-Sense: predator_sense|nitro_sense/fan_speed ("cpu,gpu", 0 = auto)
+set -euo pipefail
+
+MIN=30
+
+HWMON=""
+for h in /sys/class/hwmon/hwmon*; do
+  [[ -r $h/name && $(<"$h/name") == acer ]] && { HWMON=$h; break; }
+done
+LINUWU=""
+for f in /sys/module/linuwu_sense/drivers/platform:acer-wmi/acer-wmi/{predator_sense,nitro_sense}/fan_speed; do
+  [[ -e $f ]] && { LINUWU=$f; break; }
+done
+
+if [[ -n $HWMON && -e $HWMON/pwm1 ]]; then backend=hwmon
+elif [[ -n $LINUWU ]]; then backend=linuwu
+else backend=none
+fi
+
+die() { echo "fanctl: $*" >&2; exit 2; }
+
+valid_pct() { [[ $1 =~ ^[0-9]{1,3}$ ]] && (( $1 >= MIN && $1 <= 100 )); }
+
+# Linuwu keeps both fans in one "cpu,gpu" file.
+linuwu_read() { local c g; IFS=, read -r c g <"$LINUWU"; echo "${c//[^0-9]/} ${g//[^0-9]/}"; }
+
+# Current speed of fan $1 as "<mode> <percent>", mode 2 = auto, 1 = manual.
+fan_state() {
+  local f=$1
+  case $backend in
+    hwmon) echo "$(<"$HWMON/pwm${f}_enable") $(( $(<"$HWMON/pwm$f") * 100 / 255 ))" ;;
+    linuwu)
+      local v; read -r -a v <<<"$(linuwu_read)"; v=${v[$((f - 1))]:-0}
+      if (( v == 0 )); then echo "2 0"; else echo "1 $v"; fi ;;
+    *) echo "2 0" ;;
+  esac
+}
+
+# set_fans <mode auto|manual> <pct> <fan...>
+set_fans() {
+  local mode=$1 pct=$2; shift 2
+  case $backend in
+    hwmon)
+      for f in "$@"; do
+        if [[ $mode == auto ]]; then echo 2 >"$HWMON/pwm${f}_enable"
+        else echo 1 >"$HWMON/pwm${f}_enable"; echo $(( pct * 255 / 100 )) >"$HWMON/pwm$f"; fi
+      done ;;
+    linuwu)
+      local v; read -r -a v <<<"$(linuwu_read)"
+      for f in "$@"; do v[$((f - 1))]=$([[ $mode == auto ]] && echo 0 || echo "$pct"); done
+      echo "${v[0]:-0},${v[1]:-0}" >"$LINUWU" ;;
+    *) die "no supported fan control driver found (see agent.md)" ;;
+  esac
+}
+
+cpu_temp() {
+  local h l
+  for h in /sys/class/hwmon/hwmon*; do
+    case $(<"$h/name") in
+      coretemp)  # Intel: the "Package id 0" sensor
+        for l in "$h"/temp*_label; do
+          [[ $(<"$l") == Package* ]] && { echo $(( $(<"${l%_label}_input") / 1000 )); return; }
+        done ;;
+      k10temp|zenpower)  # AMD: Tctl, which is temp1
+        [[ -r $h/temp1_input ]] && { echo $(( $(<"$h/temp1_input") / 1000 )); return; } ;;
+    esac
+  done
+}
+
+# NVIDIA dGPU temperature. A runtime-suspended GPU is never woken just to read it.
+gpu_temp() {
+  local d t
+  for d in /sys/bus/pci/drivers/nvidia/0000:*; do
+    [[ -e $d/power/runtime_status ]] || continue
+    if [[ $(<"$d/power/runtime_status") == suspended ]]; then echo sleep; return; fi
+    command -v nvidia-smi >/dev/null || return
+    t=$(timeout 2 nvidia-smi --query-gpu=temperature.gpu --format=csv,noheader,nounits 2>/dev/null | head -n1 | tr -dc '0-9' || true)
+    [[ -n $t ]] && echo "$t"
+    return
+  done
+}
+
+case "${1:-}" in
+  status)
+    printf 'backend\t%s\n' "$backend"
+    for f in 1 2; do
+      [[ -n $HWMON && -r $HWMON/fan${f}_input ]] && printf 'fan%s_rpm\t%s\n' $f "$(<"$HWMON/fan${f}_input")"
+      read -r mode pct <<<"$(fan_state $f)"
+      printf 'fan%s_mode\t%s\nfan%s_pct\t%s\n' $f "$mode" $f "$pct"
+    done
+    t=$(cpu_temp || true); [[ -n $t ]] && printf 'cpu_temp\t%s\n' "$t"
+    t=$(gpu_temp || true); [[ -n $t ]] && printf 'gpu_temp\t%s\n' "$t"
+    true ;;
+  set)
+    case "${2:-}" in 1|2) fans=("$2") ;; all) fans=(1 2) ;; *) die "fan must be 1, 2 or all" ;; esac
+    case "${3:-}" in
+      auto) set_fans auto 0 "${fans[@]}" ;;
+      manual) valid_pct "${4:-}" || die "speed must be $MIN-100"; set_fans manual "$4" "${fans[@]}" ;;
+      *) die "mode must be auto or manual" ;;
+    esac ;;
+  max) set_fans manual 100 1 2 ;;
+  auto) set_fans auto 0 1 2 ;;
+  toggle)
+    read -r m1 _ <<<"$(fan_state 1)"; read -r m2 _ <<<"$(fan_state 2)"
+    if [[ $m1 != 1 && $m2 != 1 ]]; then set_fans manual 100 1 2; else set_fans auto 0 1 2; fi ;;
+  bump)
+    [[ ${2:-} =~ ^[+-][0-9]{1,3}$ ]] || die "bump takes +N or -N"
+    for f in 1 2; do
+      read -r m p <<<"$(fan_state $f)"
+      [[ $m == 1 ]] || p=50
+      n=$(( p + $2 )); (( n < MIN )) && n=$MIN; (( n > 100 )) && n=100
+      set_fans manual "$n" "$f"
+    done ;;
+  *) sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
+esac

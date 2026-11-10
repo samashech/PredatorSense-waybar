@@ -1,0 +1,4 @@
+# Let members of the "predator-fans" group drive the Acer fan PWM controls
+# exposed by the mainline acer_wmi driver (hwmon "acer"), without sudo.
+# Not needed with Linuwu-Sense: its own installer grants its "linuwu_sense" group access.
+SUBSYSTEM=="hwmon", ATTR{name}=="acer", RUN+="/bin/sh -c 'cd /sys%p && for f in pwm1 pwm1_enable pwm2 pwm2_enable; do [ -e $$f ] && chgrp predator-fans $$f && chmod 0664 $$f; done; true'"

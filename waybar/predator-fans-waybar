@@ -1,0 +1,41 @@
+#!/bin/bash
+# Waybar custom module for predator fans.
+#   predator-fans-waybar            print one JSON line for Waybar
+#   predator-fans-waybar profile    cycle the power profile (power-profiles-daemon)
+set -euo pipefail
+
+FANCTL=${PREDATOR_FANCTL:-$HOME/.local/bin/predator-fanctl}
+
+if [[ ${1:-} == profile ]]; then
+  command -v powerprofilesctl >/dev/null || exit 0
+  mapfile -t avail < <(powerprofilesctl list | sed -n 's/^[* ] *\([a-z-]*\):$/\1/p')
+  cur=$(powerprofilesctl get)
+  for i in "${!avail[@]}"; do
+    [[ ${avail[$i]} == "$cur" ]] && { powerprofilesctl set "${avail[$(( (i + 1) % ${#avail[@]} ))]}"; break; }
+  done
+  exit 0
+fi
+
+declare -A s=()
+while IFS=$'\t' read -r k v; do [[ -n $k ]] && s[$k]=$v; done < <("$FANCTL" status 2>/dev/null || true)
+
+mode_of() { [[ ${s[fan${1}_mode]:-2} == 1 ]] && echo "${s[fan${1}_pct]:-?}%" || echo Auto; }
+temp_of() { case ${s[$1]:-} in "") echo "n/a" ;; sleep) echo "asleep" ;; *) echo "${s[$1]} °C" ;; esac; }
+
+if [[ ${s[backend]:-none} == none ]]; then class=nodriver
+elif [[ ${s[fan1_mode]:-2} != 1 && ${s[fan2_mode]:-2} != 1 ]]; then class=auto
+elif [[ ${s[fan1_pct]:-0} -ge 99 && ${s[fan2_pct]:-0} -ge 99 ]]; then class=max
+else class=manual
+fi
+
+icon=$([[ $class == auto || $class == nodriver ]] && echo "󰈐" || echo "󰠝")
+text="$icon ${s[cpu_temp]:-?}°"
+profile=$(powerprofilesctl get 2>/dev/null || echo "n/a")
+tooltip="CPU fan: ${s[fan1_rpm]:-?} RPM ($(mode_of 1)) · CPU $(temp_of cpu_temp)
+GPU fan: ${s[fan2_rpm]:-?} RPM ($(mode_of 2)) · GPU $(temp_of gpu_temp)
+Power profile: $profile
+
+Click: Auto ↔ Max · Scroll: ±10% · Right-click: next profile"
+
+jq -cn --arg text "$text" --arg tooltip "$tooltip" --arg class "$class" \
+  '{text: $text, tooltip: $tooltip, class: $class, alt: $class}'

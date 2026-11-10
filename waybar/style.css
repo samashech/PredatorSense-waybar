@@ -1,0 +1,5 @@
+/* Append to ~/.config/waybar/style.css */
+#custom-predator-fans { padding: 0 8px; }
+#custom-predator-fans.manual { color: #e5c07b; }
+#custom-predator-fans.max { color: #e06c75; }
+#custom-predator-fans.nodriver { opacity: 0.5; }
