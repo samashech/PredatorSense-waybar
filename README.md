@@ -1,106 +1,90 @@
-# omarchy-predator-fans
+# PredatorSense-waybar
 
-Fan control for Acer Predator and Nitro laptops on Linux, right in your status bar. You don't need PredatorSense, NitroSense or DAMX running.
+PredatorSense-style tools for Acer Predator laptops on [Omarchy](https://omarchy.org), living in the Omarchy shell bar. No PredatorSense, NitroSense or DAMX needed.
 
-- **Auto / Max** for both fans in one click, or a fixed speed per fan (30–100%)
-- **Live RPM** for the CPU and GPU fans
-- **CPU and GPU temperature.** The NVIDIA GPU is never woken from sleep just to read it.
-- **Power profile** switching (power-saver / balanced / performance)
-- Works as an **Omarchy shell plugin**, a **Waybar module**, or a plain **CLI** for any other bar or keybinding
-
-It was built and tested on an Acer Predator PHN16-72 running Omarchy (Hyprland). Other models work if the kernel exposes fan control: see [Compatibility](#compatibility).
+Built and tested on an Acer Predator Helios Neo 16 (PHN16-72). The fan module also runs on plain Waybar.
 
 ## Install
 
-### Let an AI agent do it
+**With an AI agent (recommended):** give [`agent.md`](agent.md) to Claude Code, Codex or similar and ask it to follow it. It checks your laptop, installs only the drivers you're missing, asks before anything that needs `sudo`, and puts everything on your bar.
 
-Give [`agent.md`](agent.md) to your coding agent (Claude Code, Codex, etc.) and ask it to follow the file. It will:
-- detect your distro, kernel, bar and current fan driver
-- install a driver only if one is missing
-- set up permissions so you don't need sudo
-- put the module in your bar
-
-It asks before every privileged step.
-
-### Omarchy, by hand
+**By hand:**
 
 ```bash
-omarchy plugin add https://github.com/<you>/omarchy-predator-fans --enable
+git clone https://github.com/samashech/PredatorSense-waybar
+cd PredatorSense-waybar
+./install.sh              # everything, or e.g. ./install.sh fans pet
 ```
 
-The widget lands next to the clock. You still need the one-time permission setup from step 4 of [`agent.md`](agent.md), unless your driver already lets your user write the fan controls.
+`install.sh` only copies the plugins and places them on the bar. Drivers and permissions are in [`agent.md`](agent.md).
 
-### Waybar, by hand
+## Components
 
-Follow step 5b of [`agent.md`](agent.md). In short:
+### Fans
+- Auto, Max, or a fixed speed per fan, with live RPM
+- CPU and GPU temperature, without waking a sleeping NVIDIA GPU
+- Power profile switching; also works as a Waybar module or a plain CLI
 
-1. Copy `fanctl` to `~/.local/bin/predator-fanctl` and `waybar/predator-fans-waybar` to `~/.local/bin/`.
-2. Add the block from `waybar/module.jsonc` to your config, and the CSS from `waybar/style.css` to your style sheet.
+*How it's made:* a bash helper (`fanctl`) drives the kernel's hwmon `pwm` controls (mainline `acer_wmi`/`facer`) or Linuwu-Sense, with a QML panel on top.
 
-## Usage
+### Keyboard Sync
+- 4-zone RGB synced to whatever is playing, with a punchy beat kick (pulse, spectrum, wave, theme)
+- Typing ripple: the zone you type in lights up and spreads outward
+- Notification flash: blinks on new notifications, red for critical, never during Do Not Disturb
 
-| Where | Action |
-|---|---|
-| Omarchy bar icon | Left-click opens the panel. Right-click switches between Auto and Max. |
-| Omarchy panel | Auto / Max buttons, a slider per fan, power profile buttons |
-| Waybar | Click: Auto ↔ Max. Scroll: ±10%. Right-click: next power profile. Tooltip: RPM, temperatures, profile. |
+*How it's made:* a Python daemon (`kbsync`) reads the audio output through `parec`, runs a small FFT with beat detection, and writes zone colors to the `facer` driver's `/dev/acer-gkbbl-*` devices at a pace the keyboard controller can keep up with.
 
-The CLI works the same everywhere:
+### Mechanical key sounds
+- Blue (clicky), Brown (thocky) or Typewriter (with a bell on Enter)
+- Every press sounds slightly different, and big keys sound deeper
+- Volume slider; works with any keyboard, not just the RGB one
+
+*How it's made:* `keysound` synthesizes the clicks at startup (no audio files), reads key presses from `/dev/input`, and mixes them into a low-latency `pacat` stream that closes when you stop typing. Its switch is in the Keyboard Sync panel.
+
+### Now Bar
+- Phone-style media card: cover art, seek bar, play/pause/skip, output device picker
+- Shows the next 4 songs in your Spotify queue with cover art; tap one to jump to it
+- Save the current song to your library
+
+*How it's made:* QML on top of MPRIS for any player. A small Python helper (`nowq`) reads the queue from the Spotify Web API through a PKCE login (no client secret).
+
+### Tasks
+- Top 5 apps by CPU, RAM and GPU, with helper processes grouped (all of Brave counts as one)
+- RAM in MB/GB; CPU and GPU in %, plus VRAM per app
+- Samples only while the panel is open
+
+*How it's made:* `topproc` samples `/proc` over one second, reads Intel GPU use from DRM fdinfo, and calls `nvidia-smi` only when the NVIDIA GPU is already awake.
+
+### Cleaner
+- Shows how much space each cache takes: uv, mise, pip, npm, Cargo, VS Code, browsers, Spotify and more
+- Tick what to clear; browsers and apps that are open are skipped
+- Old package versions, crash dumps and old logs, with one password prompt
+
+*How it's made:* `sweep` measures and clears only known cache folders, using each tool's own clean command where one exists. System items run as a single fixed `pkexec` command.
+
+### Bar Pet
+- A tiny creature in your bar: dances to music, sleeps when you're away, sweats when the CPU is hot
+- Eats the cache the Cleaner frees, and shows a heart when you click it
+- Remembers its age, what it has eaten and how often it was petted
+
+*How it's made:* drawn entirely in QML (Canvas plus animations), reading MPRIS, UPower, the CPU temperature sensor and Wayland idle state.
+
+## Working on it
+
+Omarchy runs plugins from `~/.config/omarchy/plugins/` and doesn't allow symlinks there, so edit and test the live copies, then copy them back into the repo:
 
 ```bash
-predator-fanctl status              # backend, RPM, mode, %, CPU/GPU temperature
-predator-fanctl max                 # both fans to 100%
-predator-fanctl auto                # back to the firmware curve
-predator-fanctl toggle              # Auto <-> Max
-predator-fanctl set 1 manual 60     # CPU fan (1) to 60%; the GPU fan is 2, both is "all"
-predator-fanctl bump -10            # nudge both fans down 10%
+./sync-from-system.sh --dry   # see what changed
+./sync-from-system.sh         # copy it into plugins/
 ```
 
-The bar icon changes when any fan is under manual control, so you don't forget a fan pinned at a fixed speed.
-
-## How it works
-
-`fanctl` is a small bash script that talks to whichever kernel driver is present:
-
-| Backend | Driver | Interface |
-|---|---|---|
-| `hwmon` | mainline `acer_wmi` (or a fork such as `facer`) | `/sys/class/hwmon/hwmonN` named `acer`: `pwmX_enable` (1 manual, 2 auto) and `pwmX` (0–255) |
-| `linuwu` | [Linuwu-Sense](https://github.com/0x7375646F/Linuwu-Sense) | `predator_sense/fan_speed` or `nitro_sense/fan_speed` as `cpu,gpu` (0 = auto) |
-
-Temperatures come from hwmon `coretemp` (Intel package) or `k10temp` (AMD Tctl), and from `nvidia-smi`. The NVIDIA query only runs when the GPU is already awake.
-
-The bar UIs only read `fanctl status` and call `fanctl`. They never pass text into a shell, and the panel validates every value before showing it.
-
-## Compatibility
-
-| | Status |
-|---|---|
-| Omarchy (omarchy-shell bar) | ✅ tested |
-| Hyprland + Waybar (vanilla Arch, CachyOS) | ✅ supported (Waybar module) |
-| Ubuntu (Waybar on Hyprland/Sway) | ⚠️ supported; older Ubuntu kernels usually need Linuwu-Sense |
-| GNOME / KDE | CLI only (no bar module yet) |
-| `hwmon` backend | ✅ tested on PHN16-72 |
-| `linuwu` backend | ⚠️ implemented from Linuwu-Sense's documented interface, not yet tested on hardware |
-
-## FAQ
-
-**Do I still need DAMX or PredatorSense?**
-No. The plugin doesn't talk to DAMX at all. It only needs a kernel driver that exposes fan control. One catch: some PredatorSense ports install their own fork of the kernel driver (for example `facer`). If you uninstall such a port, also remove its `acer_wmi` blacklist so the mainline driver loads again. Step 2 of `agent.md` checks this.
-
-**Is it safe?**
-Manual speed can't go below 30%, and Auto is always one click away. The firmware may switch back to Auto after suspend or reboot. The bar shows the real state either way.
-
-## Requirements
-
-See [`requirements.txt`](requirements.txt). It lists OS packages, not pip packages. The core is just bash. `jq` is needed for Waybar, `nvidia-utils` for GPU temperature, and `power-profiles-daemon` for the profile buttons.
-
-## Files
+## Layout
 
 ```
-manifest.json, Panel.qml, i18n/   Omarchy shell plugin (repo root = plugin root)
-fanctl                            the fan helper / CLI
-waybar/                           Waybar module script, config block, CSS
-udev/99-predator-fans.rules       lets the predator-fans group drive the hwmon fan controls
-agent.md                          install guide for AI agents (and humans)
-requirements.txt                  system packages
+plugins/<id>/         one folder per Omarchy shell plugin
+install.sh            copy plugins into place and add them to the bar
+sync-from-system.sh   copy your live plugins back into the repo
+agent.md              full setup guide for AI agents (and humans)
+waybar/, udev/        Waybar fan module and the fan permission rule
+requirements.txt      system packages per component
 ```

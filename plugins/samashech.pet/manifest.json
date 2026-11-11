@@ -1,0 +1,17 @@
+{
+  "schemaVersion": 1,
+  "id": "samashech.pet",
+  "name": "Bar Pet",
+  "version": "1.0.0",
+  "author": "samashech",
+  "description": "A tiny creature living in the bar: sleeps when you're away, dances to music, sweats when the CPU is hot, eats the cache the Cleaner frees",
+  "kinds": ["bar-widget"],
+  "entryPoints": { "barWidget": "Panel.qml" },
+  "barWidget": {
+    "displayName": "Bar Pet",
+    "description": "A small pet that reacts to your machine",
+    "category": "Fun",
+    "allowMultiple": false,
+    "defaultSection": "left"
+  }
+}

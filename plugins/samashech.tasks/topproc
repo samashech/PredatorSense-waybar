@@ -1,0 +1,226 @@
+#!/usr/bin/python3
+"""topproc: top 5 apps by CPU, RAM and GPU for the Tasks panel.
+
+Samples /proc over one second. Processes with the same name are grouped
+(brave's 20 helpers count as one "brave"). Output, tab separated:
+
+  sys  cpu     <pct>
+  sys  mem     <used-bytes>  <total-bytes>
+  sys  nvidia  <util-pct>    <vram-used-MiB>  <vram-total-MiB>   | sys nvidia sleep
+  cpu  <name>  <procs>  <pct of whole machine>
+  mem  <name>  <procs>  <bytes>
+  gpu  <name>  <procs>  <pct>  <vram-MiB>  <nvidia|intel>
+
+The NVIDIA GPU is only queried while it is already awake, so this never wakes
+the dGPU on battery. Intel iGPU figures come from the kernel's DRM fdinfo.
+"""
+import os
+import re
+import subprocess
+import time
+
+CLK = os.sysconf("SC_CLK_TCK")
+PAGE = os.sysconf("SC_PAGE_SIZE")
+NCPU = os.cpu_count() or 1
+TOP = 5
+UNITS = {"": 1, "B": 1, "KiB": 1024, "MiB": 1 << 20, "GiB": 1 << 30}
+
+
+def read(path, limit=65536):
+    try:
+        with open(path, "rb") as f:
+            return f.read(limit).decode("utf-8", "replace")
+    except OSError:
+        return ""
+
+
+def name_of(pid):
+    comm = read("/proc/%s/comm" % pid).strip()
+    return re.sub(r"[\t\r\n\x00-\x1f]", " ", comm)[:32] or "?"
+
+
+def proc_sample():
+    """pid -> (name, cpu ticks, rss bytes) for user-space processes."""
+    out = {}
+    for pid in os.listdir("/proc"):
+        if not pid.isdigit():
+            continue
+        stat = read("/proc/%s/stat" % pid)
+        r = stat.rfind(")")
+        if r < 0:
+            continue
+        f = stat[r + 2:].split()
+        if len(f) < 22 or f[1] == "2" or pid == "2":   # kernel threads (children of kthreadd)
+            continue
+        statm = read("/proc/%s/statm" % pid).split()
+        rss = int(statm[1]) * PAGE if len(statm) > 1 else 0
+        if rss == 0:
+            continue  # kernel thread
+        out[pid] = (name_of(pid), int(f[11]) + int(f[12]), rss)
+    return out
+
+
+def drm_sample(pids):
+    """pid -> (busy ns of busiest engine, memory bytes) for Intel iGPU clients."""
+    out = {}
+    for pid in pids:
+        fddir = "/proc/%s/fd" % pid
+        try:
+            fds = os.listdir(fddir)
+        except OSError:
+            continue
+        clients = {}
+        for fd in fds:
+            try:
+                if not os.readlink(os.path.join(fddir, fd)).startswith("/dev/dri/"):
+                    continue
+            except OSError:
+                continue
+            info = read("/proc/%s/fdinfo/%s" % (pid, fd), 8192)
+            if "drm-driver:\ti915" not in info and "drm-driver:\txe" not in info:
+                continue
+            cid = re.search(r"^drm-client-id:\s*(\d+)", info, re.M)
+            key = cid.group(1) if cid else fd
+            if key in clients:
+                continue
+            engines = [int(n) for n in re.findall(r"^drm-engine-[\w-]+:\s*(\d+) ns", info, re.M)]
+            mem = 0
+            for m in re.finditer(r"^drm-total-[\w-]+:\s*(\d+)\s*(\w*)", info, re.M):
+                mem += int(m.group(1)) * UNITS.get(m.group(2), 1)
+            clients[key] = (engines, mem)
+        if clients:
+            busy = [sum(e[i] if i < len(e) else 0 for e, _ in clients.values())
+                    for i in range(max(len(e) for e, _ in clients.values()))]
+            out[pid] = (busy, sum(m for _, m in clients.values()))
+    return out
+
+
+def nvidia_awake():
+    for dev in os.listdir("/sys/bus/pci/devices"):
+        base = "/sys/bus/pci/devices/" + dev
+        if read(base + "/vendor").strip() == "0x10de" and read(base + "/class").startswith("0x03"):
+            return read(base + "/power/runtime_status").strip() != "suspended"
+    return None
+
+
+def start_nvidia():
+    if nvidia_awake() is not True:
+        return None
+    try:
+        pmon = subprocess.Popen(["nvidia-smi", "pmon", "-c", "1", "-s", "um"],
+                                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+        total = subprocess.Popen(["nvidia-smi", "--query-gpu=utilization.gpu,memory.used,memory.total",
+                                  "--format=csv,noheader,nounits"],
+                                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+        return pmon, total
+    except OSError:
+        return None
+
+
+def finish_nvidia(procs):
+    rows, summary = {}, None
+    if procs is None:
+        return rows, summary
+    pmon, total = procs
+    try:
+        out, _ = pmon.communicate(timeout=4)
+        for line in out.splitlines():
+            if line.startswith("#"):
+                continue
+            f = line.split()
+            # gpu pid type sm mem enc dec jpg ofa fb ccpm command
+            if len(f) < 12 or not f[1].isdigit():
+                continue
+            sm = int(f[3]) if f[3].isdigit() else 0
+            fb = int(f[9]) if f[9].isdigit() else 0
+            prev = rows.get(f[1], (0, 0))
+            rows[f[1]] = (prev[0] + sm, prev[1] + fb)
+        t, _ = total.communicate(timeout=4)
+        p = [x.strip() for x in t.strip().split(",")]
+        if len(p) == 3 and all(x.isdigit() for x in p):
+            summary = p
+    except (subprocess.TimeoutExpired, ValueError):
+        pmon.kill()
+        total.kill()
+    return rows, summary
+
+
+def cpu_total():
+    f = read("/proc/stat").split("\n", 1)[0].split()[1:]
+    v = [int(x) for x in f]
+    idle = v[3] + (v[4] if len(v) > 4 else 0)
+    return sum(v), idle
+
+
+def meminfo():
+    m = {}
+    for line in read("/proc/meminfo").splitlines():
+        k, _, rest = line.partition(":")
+        p = rest.split()
+        if p and p[0].isdigit():
+            m[k] = int(p[0]) * 1024
+    return m.get("MemTotal", 0), m.get("MemTotal", 0) - m.get("MemAvailable", 0)
+
+
+def group(items):
+    """items: iterable of (name, value...) -> {name: [count, sums...]}"""
+    g = {}
+    for name, *vals in items:
+        cur = g.setdefault(name, [0] + [0] * len(vals))
+        cur[0] += 1
+        for i, v in enumerate(vals):
+            cur[i + 1] += v
+    return g
+
+
+def main():
+    nv = start_nvidia()
+    t0 = time.monotonic()
+    c0 = cpu_total()
+    p0 = proc_sample()
+    d0 = drm_sample(p0.keys())
+    time.sleep(1.0)
+    dt = time.monotonic() - t0
+    c1 = cpu_total()
+    p1 = proc_sample()
+    d1 = drm_sample(p1.keys())
+    nv_rows, nv_sum = finish_nvidia(nv)
+
+    total, idle = c1[0] - c0[0], c1[1] - c0[1]
+    print("sys\tcpu\t%.1f" % (100.0 * (total - idle) / total if total > 0 else 0))
+    mt, mu = meminfo()
+    print("sys\tmem\t%d\t%d" % (mu, mt))
+    awake = nvidia_awake()
+    if nv_sum:
+        print("sys\tnvidia\t%s\t%s\t%s" % tuple(nv_sum))
+    elif awake is False:
+        print("sys\tnvidia\tsleep")
+
+    cpu = group((p1[pid][0], 100.0 * (p1[pid][1] - p0[pid][1]) / CLK / dt / NCPU)
+                for pid in p1 if pid in p0 and p1[pid][0] == p0[pid][0])
+    for name, (n, pct) in sorted(cpu.items(), key=lambda kv: -kv[1][1])[:TOP]:
+        print("cpu\t%s\t%d\t%.1f" % (name, n, max(0.0, pct)))
+
+    mem = group((v[0], v[2]) for v in p1.values())
+    for name, (n, rss) in sorted(mem.items(), key=lambda kv: -kv[1][1])[:TOP]:
+        print("mem\t%s\t%d\t%d" % (name, n, rss))
+
+    gpu = []
+    for pid, (busy1, mem1) in d1.items():
+        if pid not in d0 or pid not in p1:
+            continue
+        busy0 = d0[pid][0]
+        delta = max([b - (busy0[i] if i < len(busy0) else 0) for i, b in enumerate(busy1)] or [0])
+        pct = min(100.0, max(0.0, 100.0 * delta / (dt * 1e9)))
+        if pct > 0 or mem1 > 0:
+            gpu.append(((p1[pid][0], "intel"), pct, mem1 / (1 << 20)))
+    for pid, (sm, fb) in nv_rows.items():
+        gpu.append(((name_of(pid), "nvidia"), float(sm), float(fb)))
+    gg = group(gpu)
+    ranked = sorted(gg.items(), key=lambda kv: (-kv[1][1], -kv[1][2]))[:TOP]
+    for (name, dev), (n, pct, vram) in ranked:
+        print("gpu\t%s\t%d\t%.1f\t%d\t%s" % (name, n, min(100.0, pct), vram, dev))
+
+
+if __name__ == "__main__":
+    main()

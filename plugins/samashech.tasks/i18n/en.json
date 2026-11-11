@@ -1,0 +1,15 @@
+{
+  "tab.cpu": "CPU",
+  "tab.mem": "RAM",
+  "tab.gpu": "GPU",
+  "measuring": "Measuring…",
+  "idle": "Nothing is using this right now",
+  "pct": "%1%",
+  "mb": "%1 MB",
+  "gb": "%1 GB",
+  "count": "×%1",
+  "cpuTotal": "Total CPU %1",
+  "memTotal": "%1 of %2 in use",
+  "nvidiaTotal": "RTX: %1 busy · %2 of %3 VRAM",
+  "nvidiaSleep": "RTX is asleep (saving power). Intel graphics shown; its memory is shared with RAM."
+}

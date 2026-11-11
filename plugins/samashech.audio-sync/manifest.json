@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "id": "samashech.audio-sync",
+  "name": "Keyboard Sync",
+  "version": "1.2.0",
+  "author": "samashech",
+  "description": "Acer Predator 4-zone keyboard lighting (audio sync with beat punch, typing ripple, notification flash) plus mechanical key sounds",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Keyboard Sync",
+    "description": "Keyboard RGB synced to music, typing and notifications, and switch sounds as you type",
+    "category": "System",
+    "allowMultiple": false,
+    "defaultSection": "centerEnd"
+  }
+}

@@ -1,0 +1,200 @@
+#!/usr/bin/python3
+"""sweep: find and clear caches that are safe to delete, for the Cleaner panel.
+
+  sweep scan            one line per item that has something to free:
+                          item<TAB>id<TAB>bytes<TAB>ok|running
+  sweep clean ID...     clear the chosen items, one result line each:
+                          done<TAB>id<TAB>freed-bytes   | fail<TAB>id<TAB>reason
+
+Everything here is a cache: the owning tool rebuilds or re-downloads it when
+it needs it again. Nothing in ~/.config, documents, settings or logins is
+touched. Items whose app is open are reported as "running" and skipped,
+because clearing a live browser cache can confuse it.
+
+The system items (old package downloads, crash dumps, old logs) need root;
+they are cleared by one fixed pkexec command, so you are asked once.
+"""
+import os
+import re
+import shutil
+import subprocess
+import sys
+
+HOME = os.path.expanduser("~")
+H = lambda *p: os.path.join(HOME, *p)
+
+# id: (paths whose *contents* are cleared, tool command preferred over deleting, app process names)
+USER_ITEMS = {
+    "uv":        ([H(".cache/uv")], ["uv", "cache", "clean", "--force"], []),
+    "mise":      ([H(".cache/mise")], ["mise", "cache", "clear"], []),
+    "pip":       ([H(".cache/pip")], None, []),
+    "npm":       ([H(".npm/_cacache")], None, []),
+    "cargo":     ([H(".cargo/registry/cache")], None, []),
+    "aur":       ([H(".cache/yay"), H(".cache/paru")], None, ["yay", "paru", "makepkg"]),
+    "vscode":    ([H(".cache/vscode-cpptools"), H(".config/Code/CachedExtensionVSIXs"),
+                   H(".config/Code/Cache"), H(".config/Code/CachedData")], None, ["code"]),
+    "brave":     ([H(".cache/BraveSoftware")], None, ["brave"]),
+    "chromium":  ([H(".cache/chromium"), H(".cache/google-chrome")], None, ["chromium", "chrome"]),
+    "spotify":   ([H(".cache/spotify/Data")], None, ["spotify"]),
+    "thumbs":    ([H(".cache/thumbnails")], None, []),
+    "devtools":  ([H(".cache/debuginfod_client"), H(".cache/google-chrome-for-testing-headless"),
+                   H(".cache/node-gyp"), H(".cache/typescript"), H(".cache/go-build")], None, []),
+    "models":    ([H(".cache/huggingface")], None, []),
+    "trash":     ([H(".local/share/Trash/files"), H(".local/share/Trash/info")], None, []),
+}
+ROOT_ITEMS = ("pacman", "coredumps", "journal")
+JOURNAL_KEEP = 100 << 20
+COREDUMPS = "/var/lib/systemd/coredump"
+ROOT_CMD = {
+    "pacman": "paccache -rqk1; paccache -rquk0",
+    "coredumps": "find /var/lib/systemd/coredump -mindepth 1 -maxdepth 1 -type f -name 'core.*' -delete",
+    "journal": "journalctl --vacuum-size=100M -q",
+}
+ENV = dict(os.environ, LC_ALL="C")
+
+
+def size(path):
+    """Bytes on disk under path, without following symlinks."""
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return 0
+    if not os.path.isdir(path) or os.path.islink(path):
+        return st.st_blocks * 512
+    total = 0
+    for root, dirs, files in os.walk(path, onerror=lambda e: None):
+        for n in dirs + files:
+            try:
+                total += os.lstat(os.path.join(root, n)).st_blocks * 512
+            except OSError:
+                pass
+    return total
+
+
+def running(names):
+    if not names:
+        return False
+    for pid in os.listdir("/proc"):
+        if pid.isdigit():
+            try:
+                with open("/proc/%s/comm" % pid) as f:
+                    if f.read().strip() in names:
+                        return True
+            except OSError:
+                pass
+    return False
+
+
+def pacman_reclaim():
+    total = 0
+    for args in (["-dk1"], ["-duk0"]):
+        try:
+            out = subprocess.run(["paccache"] + args, capture_output=True, text=True, timeout=30, env=ENV).stdout
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        m = re.search(r"disk space saved: ([\d.]+) (\w+)", out)
+        if m:
+            unit = {"B": 1, "KiB": 1 << 10, "MiB": 1 << 20, "GiB": 1 << 30, "TiB": 1 << 40}.get(m.group(2), 1)
+            total += int(float(m.group(1)) * unit)
+    return total
+
+
+def journal_bytes():
+    try:
+        out = subprocess.run(["journalctl", "--disk-usage"], capture_output=True, text=True, timeout=10, env=ENV).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return 0
+    m = re.search(r"take up ([\d.]+)([KMGT]?)", out)
+    if not m:
+        return 0
+    return int(float(m.group(1)) * {"": 1, "K": 1 << 10, "M": 1 << 20, "G": 1 << 30, "T": 1 << 40}[m.group(2)])
+
+
+def root_size(item):
+    if item == "pacman":
+        return pacman_reclaim()
+    if item == "coredumps":
+        return size(COREDUMPS)
+    if item == "journal":
+        return max(0, journal_bytes() - JOURNAL_KEEP)
+    return 0
+
+
+def user_size(item):
+    return sum(size(p) for p in USER_ITEMS[item][0])
+
+
+def clear_contents(path):
+    """Delete everything inside path (the folder itself stays). Never follows symlinks."""
+    real = os.path.realpath(path)
+    if not real.startswith(HOME + os.sep) or real == HOME or not os.path.isdir(real) or os.path.islink(path):
+        return
+    for name in os.listdir(real):
+        p = os.path.join(real, name)
+        try:
+            if os.path.isdir(p) and not os.path.islink(p):
+                shutil.rmtree(p, ignore_errors=True)
+            else:
+                os.unlink(p)
+        except OSError:
+            pass
+
+
+def cmd_scan():
+    for item, (paths, _, procs) in USER_ITEMS.items():
+        b = user_size(item)
+        if b >= 1 << 20:
+            print("item\t%s\t%d\t%s" % (item, b, "running" if running(procs) else "ok"), flush=True)
+    for item in ROOT_ITEMS:
+        b = root_size(item)
+        if b >= 1 << 20:
+            print("item\t%s\t%d\tok" % (item, b), flush=True)
+
+
+def cmd_clean(ids):
+    ids = [i for i in dict.fromkeys(ids) if i in USER_ITEMS or i in ROOT_ITEMS]
+    for item in [i for i in ids if i in USER_ITEMS]:
+        paths, tool, procs = USER_ITEMS[item]
+        if running(procs):
+            print("fail\t%s\trunning" % item, flush=True)
+            continue
+        before = user_size(item)
+        if tool and shutil.which(tool[0]):
+            try:
+                subprocess.run(tool, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=300)
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+        for p in paths:
+            clear_contents(p)
+        print("done\t%s\t%d" % (item, max(0, before - user_size(item))), flush=True)
+
+    root = [i for i in ids if i in ROOT_ITEMS]
+    if root:
+        before = {i: root_size(i) for i in root}
+        script = "; ".join(ROOT_CMD[i] for i in root)
+        try:
+            r = subprocess.run(["pkexec", "/usr/bin/sh", "-c", script],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=600)
+            ok = r.returncode not in (126, 127)  # 126: auth dismissed, 127: not authorized
+        except (OSError, subprocess.TimeoutExpired):
+            ok = False
+        for i in root:
+            if ok:
+                print("done\t%s\t%d" % (i, max(0, before[i] - root_size(i))), flush=True)
+            else:
+                print("fail\t%s\tauth" % i, flush=True)
+
+
+def main():
+    a = sys.argv[1:]
+    if a[:1] == ["scan"]:
+        cmd_scan()
+    elif a[:1] == ["clean"] and len(a) > 1:
+        cmd_clean(a[1:])
+    else:
+        print(__doc__.strip(), file=sys.stderr)
+        sys.exit(2)
+
+
+if __name__ == "__main__":
+    main()

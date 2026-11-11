@@ -1,0 +1,379 @@
+#!/usr/bin/python3
+"""keysound: mechanical keyboard sounds for the built-in keyboard.
+
+  keysound run              play a sound on every key press (and release)
+  keysound demo [SOUND]     play a short typing sample, then exit
+
+Sounds are synthesized at startup (no audio files): "blue" (clicky switch),
+"brown" (soft tactile thock) and "typewriter" (metal clack, bell on Enter).
+Settings come from Keyboard Sync's config.json (sounds, sound, volume) and
+are picked up live. Keys are read from /dev/input without grabbing them, and
+only key codes are used: what you type is never recorded.
+
+Audio goes to the default output through `pacat` with low latency. The
+stream is opened on the first key and closed after a few idle seconds, so
+the sound card can sleep while you're not typing.
+"""
+import ctypes
+import json
+import math
+import os
+import random
+import select
+import signal
+import struct
+import subprocess
+import sys
+import time
+from array import array
+
+STATE_DIR = os.path.join(os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state"), "omarchy-audio-sync")
+CONFIG = os.path.join(STATE_DIR, "config.json")
+KEYBOARD_NAME = "AT Translated Set 2 keyboard"
+RATE = 32000
+CHUNK = 256                 # frames per write (8 ms)
+IDLE_CLOSE = 4.0            # close the audio stream after this many quiet seconds
+VARIANTS = 6
+EVENT = struct.Struct("llHHi")
+EV_KEY = 1
+KEY_ENTER, KEY_SPACE, KEY_BACKSPACE = 28, 57, 14
+BIG_KEYS = {KEY_ENTER, KEY_SPACE, KEY_BACKSPACE, 42, 54, 15, 58, 96}   # shifts, tab, caps, kp-enter
+SOUNDS = ("blue", "brown", "typewriter")
+
+
+# ---------------------------------------------------------------- synthesis
+def env(t, tau):
+    return math.exp(-t / tau)
+
+
+def noise_burst(rng, n, hp=0.0, lp=1.0):
+    """White noise through a one-pole high-pass then low-pass (coefficients 0..1)."""
+    out, x_prev, hp_y, lp_y = [], 0.0, 0.0, 0.0
+    for _ in range(n):
+        x = rng.uniform(-1, 1)
+        hp_y = hp * (hp_y + x - x_prev)
+        x_prev = x
+        lp_y += lp * (hp_y - lp_y)
+        out.append(lp_y)
+    return out
+
+
+def tone(f, tau, n, phase=0.0):
+    w = 2 * math.pi * f / RATE
+    return [math.sin(w * i + phase) * env(i / RATE, tau) for i in range(n)]
+
+
+def add(dst, src, gain=1.0, offset=0):
+    for i, v in enumerate(src):
+        j = i + offset
+        if j >= len(dst):
+            break
+        dst[j] += v * gain
+
+
+def finish(buf, gain):
+    peak = max(1e-6, max(abs(v) for v in buf))
+    scale = gain / peak
+    # tiny fade-in/out so nothing clicks digitally
+    n = len(buf)
+    for i in range(min(16, n)):
+        buf[i] *= i / 16
+        buf[n - 1 - i] *= i / 16
+    return [v * scale for v in buf]
+
+
+def make(kind, big, rng):
+    p = rng.uniform(0.94, 1.06) * (0.78 if big else 1.0)
+    if kind == "blue":
+        n = int(RATE * 0.07)
+        b = [0.0] * n
+        click = noise_burst(rng, int(RATE * 0.004), hp=0.92, lp=0.9)
+        add(b, [v * env(i / RATE, 0.0012) for i, v in enumerate(click)], 1.0)
+        add(b, tone(4200 * p, 0.004, n), 0.6)
+        bottom = int(RATE * 0.009)
+        add(b, tone(1100 * p, 0.012, n), 0.55, bottom)
+        add(b, [v * env(i / RATE, 0.006) for i, v in enumerate(noise_burst(rng, n, hp=0.6, lp=0.5))], 0.45, bottom)
+        if big:
+            add(b, tone(320 * p, 0.03, n), 0.5, bottom)
+        return finish(b, 0.9)
+    if kind == "brown":
+        n = int(RATE * 0.08)
+        b = [0.0] * n
+        add(b, tone(380 * p, 0.022, n), 1.0)
+        add(b, tone(760 * p, 0.012, n), 0.35)
+        add(b, [v * env(i / RATE, 0.008) for i, v in enumerate(noise_burst(rng, n, hp=0.3, lp=0.25))], 0.8)
+        if big:
+            add(b, tone(190 * p, 0.04, n), 0.7)
+        return finish(b, 0.85)
+    # typewriter
+    n = int(RATE * 0.12)
+    b = [0.0] * n
+    add(b, [v * env(i / RATE, 0.003) for i, v in enumerate(noise_burst(rng, n, hp=0.85, lp=0.95))], 1.0)
+    add(b, tone(2300 * p, 0.03, n), 0.45)
+    add(b, tone(5100 * p, 0.02, n), 0.25)
+    add(b, tone(160 * p, 0.035, n), 0.8)
+    return finish(b, 0.95)
+
+
+def make_release(kind, rng):
+    if kind == "brown":
+        n = int(RATE * 0.03)
+        b = [0.0] * n
+        add(b, tone(520 * rng.uniform(0.95, 1.05), 0.008, n), 1.0)
+        return finish(b, 0.25)
+    if kind == "blue":
+        n = int(RATE * 0.03)
+        b = [0.0] * n
+        add(b, tone(3600 * rng.uniform(0.95, 1.05), 0.003, n), 0.6)
+        add(b, [v * env(i / RATE, 0.002) for i, v in enumerate(noise_burst(rng, n, hp=0.9, lp=0.9))], 0.5)
+        return finish(b, 0.35)
+    return None
+
+
+def make_bell(rng):
+    n = int(RATE * 0.9)
+    b = [0.0] * n
+    add(b, tone(2093, 0.25, n), 1.0)
+    add(b, tone(4186, 0.12, n), 0.35)
+    add(b, tone(6280, 0.06, n), 0.15)
+    return finish(b, 0.5)
+
+
+def bank(kind):
+    rng = random.Random(7)
+    return {
+        "key": [make(kind, False, rng) for _ in range(VARIANTS)],
+        "big": [make(kind, True, rng) for _ in range(3)],
+        "up": [r for r in (make_release(kind, rng) for _ in range(4)) if r],
+        "bell": make_bell(rng) if kind == "typewriter" else None,
+    }
+
+
+# ---------------------------------------------------------------- audio out
+class Output:
+    def __init__(self):
+        self.proc = None
+        self.voices = []          # [samples, position, gain]
+        self.next_write = 0.0
+        self.last_sound = 0.0
+
+    def play(self, samples, gain, delay=0):
+        if samples:
+            self.voices.append([samples, -int(delay * RATE), gain])
+            self.last_sound = time.monotonic()
+
+    def _open(self):
+        try:
+            self.proc = subprocess.Popen(
+                ["pacat", "--playback", "--raw", "--format=s16le", "--rate=%d" % RATE, "--channels=1",
+                 "--latency-msec=12", "--client-name=Keyboard sounds", "--stream-name=Key clicks",
+                 "--property=media.role=event"],
+                stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                preexec_fn=die_with_parent)
+        except OSError:
+            self.proc = None
+        self.next_write = time.monotonic()
+
+    def close(self):
+        if self.proc:
+            try:
+                self.proc.stdin.close()
+            except OSError:
+                pass
+            self.proc.terminate()
+            self.proc = None
+
+    def busy(self):
+        return bool(self.voices)
+
+    def wait(self, now):
+        if self.voices:
+            return max(0.0, self.next_write - now)
+        if self.proc and now - self.last_sound > IDLE_CLOSE:
+            self.close()
+        return None
+
+    def pump(self, now):
+        """Mix and write one chunk if it is time; paced to real time so nothing queues up."""
+        if not self.voices or now < self.next_write:
+            return
+        if self.proc is None or self.proc.poll() is not None:
+            self._open()
+            if self.proc is None:
+                self.voices = []
+                return
+        mix = [0.0] * CHUNK
+        alive = []
+        for v in self.voices:
+            s, pos, g = v
+            for i in range(CHUNK):
+                j = pos + i
+                if 0 <= j < len(s):
+                    mix[i] += s[j] * g
+            v[1] = pos + CHUNK
+            if v[1] < len(s):
+                alive.append(v)
+        self.voices = alive
+        pcm = array("h", (int(max(-1.0, min(1.0, x)) * 32767) for x in mix))
+        try:
+            self.proc.stdin.write(pcm.tobytes())
+            self.proc.stdin.flush()
+        except (BrokenPipeError, OSError):
+            self.close()
+        # stay at most ~1 chunk ahead of real time
+        self.next_write = max(self.next_write + CHUNK / RATE, now - CHUNK / RATE)
+
+
+# ---------------------------------------------------------------- helpers
+def die_with_parent():
+    try:
+        ctypes.CDLL("libc.so.6").prctl(1, signal.SIGTERM)
+    except OSError:
+        pass
+
+
+def load_cfg():
+    out = {"sounds": False, "sound": "blue", "volume": 60}
+    try:
+        with open(CONFIG) as f:
+            c = json.load(f)
+        if isinstance(c.get("sounds"), bool):
+            out["sounds"] = c["sounds"]
+        if c.get("sound") in SOUNDS:
+            out["sound"] = c["sound"]
+        v = c.get("volume")
+        if isinstance(v, (int, float)) and not isinstance(v, bool):
+            out["volume"] = int(max(5, min(100, v)))
+    except (OSError, ValueError, AttributeError):
+        pass
+    return out
+
+
+def find_keyboard():
+    try:
+        with open("/proc/bus/input/devices") as f:
+            blocks = f.read(1 << 20).split("\n\n")
+    except OSError:
+        return None
+    for b in blocks:
+        if 'N: Name="%s"' % KEYBOARD_NAME not in b:
+            continue
+        for line in b.splitlines():
+            if line.startswith("H: Handlers="):
+                for h in line.split("=", 1)[1].split():
+                    if h.startswith("event") and h[5:].isdigit():
+                        return "/dev/input/" + h
+    return None
+
+
+def gain_of(volume):
+    return (volume / 100.0) ** 1.6   # perceptual-ish curve
+
+
+# ---------------------------------------------------------------- main
+def run():
+    die_with_parent()
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+    cfg = load_cfg()
+    cfg_mtime = 0.0
+    banks = {}
+    out = Output()
+    keys = None
+    last_try = 0.0
+    held = set()
+    print("s\tready", flush=True)
+    try:
+        while True:
+            now = time.monotonic()
+            if keys is None and now - last_try > 2:
+                last_try = now
+                path = find_keyboard()
+                try:
+                    keys = os.open(path, os.O_RDONLY | os.O_NONBLOCK) if path else None
+                except OSError:
+                    keys = None
+                print("s\tkeys\t%s" % ("ok" if keys is not None else "noaccess"), flush=True)
+            try:
+                m = os.stat(CONFIG).st_mtime
+            except OSError:
+                m = 0.0
+            if m != cfg_mtime:
+                cfg_mtime, cfg = m, load_cfg()   # the panel starts and stops this process
+            kind = cfg["sound"]
+            if kind not in banks:
+                banks[kind] = bank(kind)
+            b = banks[kind]
+
+            w = out.wait(now)
+            timeout = 0.5 if w is None else w
+            r, _, _ = select.select([keys] if keys is not None else [], [], [], timeout)
+            now = time.monotonic()
+            if r:
+                try:
+                    data = os.read(keys, EVENT.size * 64)
+                except BlockingIOError:
+                    data = b""
+                except OSError:
+                    os.close(keys)
+                    keys, data = None, b""
+                g = gain_of(cfg["volume"])
+                for off in range(0, len(data) - EVENT.size + 1, EVENT.size):
+                    _, _, etype, code, value = EVENT.unpack_from(data, off)
+                    if etype != EV_KEY:
+                        continue
+                    if value == 1 and code not in held:
+                        held.add(code)
+                        big = code in BIG_KEYS
+                        out.play(random.choice(b["big"] if big else b["key"]), g * (1.0 if big else 0.85))
+                        if code == KEY_ENTER and b["bell"]:
+                            out.play(b["bell"], g * 0.6, delay=0.09)
+                    elif value == 0:
+                        held.discard(code)
+                        if b["up"]:
+                            out.play(random.choice(b["up"]), g * 0.8)
+            out.pump(now)
+    finally:
+        out.close()
+
+
+def demo(kind):
+    b = bank(kind)
+    out = Output()
+    g = gain_of(load_cfg()["volume"])
+    t0 = time.monotonic()
+    rng = random.Random(3)
+    t, plan = 0.0, []
+    for word in ("hello", "there", "omarchy"):
+        for _ in word:
+            plan.append((t, False))
+            t += rng.uniform(0.07, 0.14)
+        plan.append((t, True))   # space / enter
+        t += 0.22
+    i = 0
+    while i < len(plan) or out.busy():
+        now = time.monotonic() - t0
+        while i < len(plan) and plan[i][0] <= now:
+            big = plan[i][1]
+            out.play(rng.choice(b["big"] if big else b["key"]), g)
+            if big and i == len(plan) - 1 and b["bell"]:
+                out.play(b["bell"], g * 0.6, delay=0.09)
+            i += 1
+        out.pump(time.monotonic())
+        time.sleep(0.002)
+    time.sleep(0.15)
+    out.close()
+
+
+def main():
+    a = sys.argv[1:]
+    if a[:1] == ["run"]:
+        run()
+    elif a[:1] == ["demo"]:
+        demo(a[1] if len(a) > 1 and a[1] in SOUNDS else load_cfg()["sound"])
+    else:
+        print(__doc__.strip(), file=sys.stderr)
+        sys.exit(2)
+
+
+if __name__ == "__main__":
+    main()

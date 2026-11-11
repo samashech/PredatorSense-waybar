@@ -1,0 +1,12 @@
+{
+  "nothingPlaying": "Nothing playing",
+  "output": "Output device",
+  "previous": "Previous",
+  "next": "Next",
+  "save": "Save to Your Library",
+  "saved": "In Your Library (click to remove)",
+  "connectHint": "Connect Spotify to see the next 4 songs in your queue.",
+  "needsSetup": "To see what's next, set up a Spotify app: run `nowq setup <Client ID>` from this plugin's folder.",
+  "connect": "Connect Spotify",
+  "waitingForBrowser": "Finish signing in in your browser…"
+}

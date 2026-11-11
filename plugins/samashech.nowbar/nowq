@@ -1,0 +1,322 @@
+#!/usr/bin/python3
+"""nowq: Spotify queue + library helper for the Now Bar.
+
+  nowq setup CLIENT_ID   save your Spotify app's Client ID
+  nowq login             sign in once in the browser (PKCE; no client secret)
+  nowq logout            forget the saved login
+  nowq status            auth<TAB>ok|nologin|noclient
+  nowq queue             now<TAB>uri, saved<TAB>true|false, then up to 4 lines
+                         q<TAB>uri<TAB>title<TAB>artist<TAB>art-path
+  nowq save URI | unsave URI   add/remove the track from Your Library
+  nowq art URL           cache Spotify cover art locally, print its path
+
+Network: only https://accounts.spotify.com, https://api.spotify.com and cover
+art from https://i.scdn.co, and only when the Now Bar asks (track change, or
+every 20 s while its card is open). The login lives in
+~/.local/state/omarchy-nowbar/ (mode 600) and never leaves this machine except
+to Spotify.
+"""
+import base64
+import hashlib
+import http.server
+import json
+import os
+import re
+import secrets
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+STATE = os.path.join(os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state"), "omarchy-nowbar")
+CACHE = os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"), "omarchy-nowbar", "art")
+AUTH = os.path.join(STATE, "auth.json")
+PORT = 8898
+REDIRECT = "http://127.0.0.1:%d/callback" % PORT
+SCOPES = "user-read-playback-state user-library-read user-library-modify"
+MAX_JSON = 2 << 20
+MAX_ART = 1 << 20
+
+URI_RE = re.compile(r"^spotify:(track|episode):[A-Za-z0-9]{22}$")
+ART_RE = re.compile(r"^https://i\.scdn\.co/image/[0-9a-f]{16,64}$")
+CLIENT_RE = re.compile(r"^[0-9a-f]{32}$")
+
+
+def die(msg, code=1):
+    print("nowq: " + msg, file=sys.stderr)
+    sys.exit(code)
+
+
+# ---------------------------------------------------------------- storage
+def load_auth():
+    try:
+        with open(AUTH) as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_auth(d):
+    os.makedirs(STATE, mode=0o700, exist_ok=True)
+    tmp = AUTH + ".tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        json.dump(d, f)
+    os.replace(tmp, AUTH)
+
+
+# ---------------------------------------------------------------- http
+def request(method, url, data=None, headers=None, limit=MAX_JSON, timeout=6):
+    req = urllib.request.Request(url, data=data, method=method, headers=headers or {})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        body = r.read(limit + 1)
+        if len(body) > limit:
+            raise ValueError("response too large")
+        return r.status, r.headers, body
+
+
+def token_call(form):
+    data = urllib.parse.urlencode(form).encode()
+    _, _, body = request("POST", "https://accounts.spotify.com/api/token", data,
+                         {"Content-Type": "application/x-www-form-urlencoded"})
+    return json.loads(body)
+
+
+def access_token():
+    a = load_auth()
+    if not CLIENT_RE.match(str(a.get("client_id", ""))):
+        return None, "noclient"
+    if not a.get("refresh_token"):
+        return None, "nologin"
+    if a.get("access_token") and a.get("expires", 0) > time.time() + 30:
+        return a["access_token"], "ok"
+    try:
+        t = token_call({"grant_type": "refresh_token", "refresh_token": a["refresh_token"],
+                        "client_id": a["client_id"]})
+    except urllib.error.HTTPError as e:
+        if e.code in (400, 401):
+            a.pop("refresh_token", None)
+            save_auth(a)
+            return None, "nologin"
+        return None, "error"
+    except (OSError, ValueError):
+        return None, "error"
+    a["access_token"] = t.get("access_token", "")
+    a["expires"] = time.time() + int(t.get("expires_in", 3600))
+    if t.get("refresh_token"):
+        a["refresh_token"] = t["refresh_token"]
+    save_auth(a)
+    return a["access_token"], "ok"
+
+
+def api(method, path, query=None):
+    tok, status = access_token()
+    if not tok:
+        return None, status
+    a = load_auth()
+    if a.get("backoff_until", 0) > time.time():
+        return None, "busy"
+    url = "https://api.spotify.com/v1" + path + ("?" + urllib.parse.urlencode(query) if query else "")
+    try:
+        code, _, body = request(method, url, b"" if method in ("PUT", "DELETE") else None,
+                                {"Authorization": "Bearer " + tok})
+    except urllib.error.HTTPError as e:
+        if e.code == 429:
+            wait = e.headers.get("Retry-After", "30")
+            a["backoff_until"] = time.time() + min(600, int(wait) if wait.isdigit() else 30)
+            save_auth(a)
+            return None, "busy"
+        if e.code == 401:
+            a["expires"] = 0
+            save_auth(a)
+        return None, "http%d" % e.code
+    except (OSError, ValueError):
+        return None, "error"
+    if code == 204 or not body:
+        return {}, "ok"
+    try:
+        return json.loads(body), "ok"
+    except ValueError:
+        return None, "error"
+
+
+# ---------------------------------------------------------------- art
+def cache_art(url):
+    if not ART_RE.match(url or ""):
+        return ""
+    os.makedirs(CACHE, mode=0o700, exist_ok=True)
+    path = os.path.join(CACHE, url.rsplit("/", 1)[1] + ".jpg")
+    if os.path.exists(path):
+        return path
+    try:
+        _, headers, body = request("GET", url, limit=MAX_ART, timeout=6)
+    except (OSError, ValueError):
+        return ""
+    ctype = headers.get("Content-Type", "")
+    if not ctype.startswith("image/") or not body:
+        return ""
+    tmp = path + ".tmp"
+    with open(tmp, "wb") as f:
+        f.write(body)
+    os.replace(tmp, path)
+    prune()
+    return path
+
+
+def prune(keep=300):
+    try:
+        files = sorted((os.path.join(CACHE, n) for n in os.listdir(CACHE)), key=os.path.getmtime)
+    except OSError:
+        return
+    for p in files[:-keep]:
+        try:
+            os.remove(p)
+        except OSError:
+            pass
+
+
+def clean(s, n=160):
+    return re.sub(r"[\t\r\n\x00-\x1f]", " ", str(s or ""))[:n].strip()
+
+
+def pick_image(images):
+    best = ""
+    for im in images or []:
+        if not isinstance(im, dict):
+            continue
+        url, w = im.get("url", ""), im.get("width") or 0
+        if ART_RE.match(url or ""):
+            if not best or (w and 200 <= w <= 400):
+                best = url
+    return best
+
+
+def describe(item):
+    if not isinstance(item, dict):
+        return None
+    uri = item.get("uri", "")
+    if not URI_RE.match(uri or ""):
+        return None
+    if item.get("type") == "episode":
+        artist = (item.get("show") or {}).get("name", "")
+        images = item.get("images") or (item.get("show") or {}).get("images")
+    else:
+        artist = ", ".join(a.get("name", "") for a in (item.get("artists") or [])[:3] if isinstance(a, dict))
+        images = (item.get("album") or {}).get("images")
+    return uri, clean(item.get("name")), clean(artist), pick_image(images)
+
+
+# ---------------------------------------------------------------- commands
+def cmd_queue():
+    data, status = api("GET", "/me/player/queue")
+    if data is None:
+        print("auth\t%s" % status)
+        return
+    print("auth\tok")
+    now = describe(data.get("currently_playing"))
+    if now:
+        print("now\t%s" % now[0])
+        saved, st = api("GET", "/me/library/contains", {"uris": now[0]})
+        if isinstance(saved, list) and saved:
+            print("saved\t%s" % ("true" if saved[0] is True else "false"))
+    for item in (data.get("queue") or [])[:4]:
+        d = describe(item)
+        if not d:
+            continue
+        uri, title, artist, art = d
+        print("q\t%s\t%s\t%s\t%s" % (uri, title, artist, cache_art(art)))
+
+
+def cmd_library(method, uri):
+    if not URI_RE.match(uri):
+        die("bad uri")
+    _, status = api(method, "/me/library", {"uris": uri})
+    print("result\t%s" % status)
+
+
+def cmd_login():
+    a = load_auth()
+    cid = str(a.get("client_id", ""))
+    if not CLIENT_RE.match(cid):
+        die("run `nowq setup CLIENT_ID` first")
+    verifier = secrets.token_urlsafe(64)
+    challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
+    state = secrets.token_urlsafe(16)
+    url = "https://accounts.spotify.com/authorize?" + urllib.parse.urlencode({
+        "client_id": cid, "response_type": "code", "redirect_uri": REDIRECT, "scope": SCOPES,
+        "code_challenge_method": "S256", "code_challenge": challenge, "state": state})
+    result = {}
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            ok = self.path.startswith("/callback") and q.get("state", [""])[0] == state and "code" in q
+            if ok:
+                result["code"] = q["code"][0]
+            else:
+                result["error"] = q.get("error", ["bad callback"])[0]
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.end_headers()
+            msg = "Now Bar is connected to Spotify. You can close this tab." if ok else "Sign-in failed. You can close this tab."
+            self.wfile.write(("<!doctype html><title>Now Bar</title><p style='font:16px sans-serif;margin:3em'>%s</p>" % msg).encode())
+
+        def log_message(self, *args):
+            pass
+
+    srv = http.server.HTTPServer(("127.0.0.1", PORT), Handler)
+    srv.timeout = 1
+    print("Opening Spotify sign-in in your browser...")
+    print("If it doesn't open, visit:\n" + url)
+    subprocess.Popen(["xdg-open", url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    deadline = time.time() + 180
+    while not result and time.time() < deadline:
+        srv.handle_request()
+    srv.server_close()
+    if "code" not in result:
+        die("sign-in %s" % (result.get("error") or "timed out"))
+    t = token_call({"grant_type": "authorization_code", "code": result["code"], "redirect_uri": REDIRECT,
+                    "client_id": cid, "code_verifier": verifier})
+    if not t.get("refresh_token"):
+        die("Spotify did not return a login token")
+    a.update({"refresh_token": t["refresh_token"], "access_token": t.get("access_token", ""),
+              "expires": time.time() + int(t.get("expires_in", 3600))})
+    save_auth(a)
+    print("Connected. The Now Bar will show your queue.")
+
+
+def main():
+    args = sys.argv[1:]
+    cmd = args[0] if args else ""
+    if cmd == "setup" and len(args) == 2:
+        if not CLIENT_RE.match(args[1].strip()):
+            die("that doesn't look like a Client ID (32 hex characters)")
+        a = load_auth()
+        if a.get("client_id") != args[1].strip():
+            a = {"client_id": args[1].strip()}
+        save_auth(a)
+        print("Saved. Now run: nowq login")
+    elif cmd == "login":
+        cmd_login()
+    elif cmd == "logout":
+        a = load_auth()
+        save_auth({"client_id": a.get("client_id", "")})
+        print("Signed out.")
+    elif cmd == "status":
+        print("auth\t%s" % access_token()[1])
+    elif cmd == "queue":
+        cmd_queue()
+    elif cmd in ("save", "unsave") and len(args) == 2:
+        cmd_library("PUT" if cmd == "save" else "DELETE", args[1])
+    elif cmd == "art" and len(args) == 2:
+        print(cache_art(args[1]))
+    else:
+        print(__doc__.strip(), file=sys.stderr)
+        sys.exit(2)
+
+
+if __name__ == "__main__":
+    main()

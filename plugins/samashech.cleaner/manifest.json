@@ -1,0 +1,17 @@
+{
+  "schemaVersion": 1,
+  "id": "samashech.cleaner",
+  "name": "Cleaner",
+  "version": "1.0.0",
+  "author": "samashech",
+  "description": "Frees disk space by clearing caches that are safe to delete: uv, mise, pip, npm, browser caches, old packages, crash dumps and more",
+  "kinds": ["bar-widget"],
+  "entryPoints": { "barWidget": "Panel.qml" },
+  "barWidget": {
+    "displayName": "Cleaner",
+    "description": "Pick caches to clear and see how much space you get back",
+    "category": "System",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}

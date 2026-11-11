@@ -1,29 +1,42 @@
-# System requirements for omarchy-predator-fans.
+# System requirements for PredatorSense-waybar.
 # These are OS packages, not Python packages: do not run `pip install -r` on this file.
-# Names are Arch / CachyOS (pacman) first, Ubuntu (apt) after the "|".
+# Arch / CachyOS (pacman) names first, Ubuntu (apt) after the "|".
 # agent.md explains which lines apply to which setup.
 
 ## Always
 bash                      | bash
-coreutils                 | coreutils
+python3 (/usr/bin/python3)| python3            # helpers use the standard library only
+# Omarchy shell (omarchy-shell / Quickshell) for every component except the Waybar fan module.
 
-## Fan control driver (exactly ONE of these must provide fan control)
-# a) Mainline acer_wmi: ships with the kernel, nothing to install. Preferred.
-# b) Linuwu-Sense (https://github.com/0x7375646F/Linuwu-Sense), only if (a) exposes no fan control:
+## Fans: exactly ONE driver must provide fan control
+# a) mainline acer_wmi (ships with the kernel), or
+# b) facer (https://github.com/cleyton1986/predator-sense, also needed for Keyboard Sync), or
+# c) Linuwu-Sense (https://github.com/0x7375646F/Linuwu-Sense)
+# b) and c) build with DKMS:
 git                       | git
 dkms                      | dkms
 base-devel                | build-essential
-<kernel>-headers          | linux-headers-$(uname -r)
-#   <kernel>-headers must match the running kernel: `pacman -Qo /usr/lib/modules/$(uname -r)`
-#   e.g. linux-headers, linux-zen-headers, linux-lts-headers, linux-cachyos-headers.
+<kernel>-headers          | linux-headers-$(uname -r)    # must match the running kernel
+nvidia-utils              | nvidia-utils-<version>       # optional: GPU temperature
+power-profiles-daemon     | power-profiles-daemon        # optional: power profile buttons
+jq                        | jq                           # Waybar module only
+waybar                    | waybar                       # Waybar module only
 
-## Optional features
-nvidia-utils              | nvidia-utils-<driver-version>   # GPU temperature (nvidia-smi)
-power-profiles-daemon     | power-profiles-daemon           # power profile buttons / right-click
-jq                        | jq                              # Waybar module only
-waybar                    | waybar                          # Waybar module only
+## Keyboard Sync + key sounds
+# facer driver (see above) for /dev/acer-gkbbl-*; user in the "input" group for typing ripple and key sounds
+libpulse                  | pulseaudio-utils             # parec (audio sync) and pacat (key sounds); works on PipeWire
+dbus                      | dbus                         # dbus-monitor (notification flash)
 
-## Desktop
-# Omarchy:           the bar plugin runs inside omarchy-shell (`command -v omarchy-shell` must succeed). Nothing extra.
-#                    Older Omarchy releases that still use Waybar: use the Waybar module.
-# Hyprland/Sway/etc: use the Waybar module, or just the `predator-fanctl` CLI.
+## Now Bar
+# nothing extra; the Spotify queue needs a free Spotify developer app (owner must have Premium)
+xdg-utils                 | xdg-utils                    # opens the browser for `nowq login`
+
+## Tasks
+nvidia-utils              | nvidia-utils-<version>       # optional: NVIDIA per-app usage
+
+## Cleaner
+pacman-contrib            | -                            # paccache, for "old package versions" (Arch only)
+polkit                    | policykit-1                  # one password prompt for system items
+
+## Bar Pet
+# nothing extra

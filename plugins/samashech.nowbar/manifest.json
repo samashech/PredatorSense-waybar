@@ -1,0 +1,17 @@
+{
+  "schemaVersion": 1,
+  "id": "samashech.nowbar",
+  "name": "Now Bar",
+  "version": "1.0.0",
+  "author": "samashech",
+  "description": "Now-playing card: cover art, seek bar, controls, output device, save to library, and the next 4 songs in your Spotify queue",
+  "kinds": ["bar-widget"],
+  "entryPoints": { "barWidget": "Panel.qml" },
+  "barWidget": {
+    "displayName": "Now Bar",
+    "description": "What's playing and what's next",
+    "category": "Media",
+    "allowMultiple": false,
+    "defaultSection": "centerBegin"
+  }
+}

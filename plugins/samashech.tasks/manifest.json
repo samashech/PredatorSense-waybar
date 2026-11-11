@@ -1,0 +1,17 @@
+{
+  "schemaVersion": 1,
+  "id": "samashech.tasks",
+  "name": "Tasks",
+  "version": "1.0.0",
+  "author": "samashech",
+  "description": "Minimal task manager: top 5 apps by CPU, RAM and GPU (with VRAM). Samples only while open",
+  "kinds": ["bar-widget"],
+  "entryPoints": { "barWidget": "Panel.qml" },
+  "barWidget": {
+    "displayName": "Tasks",
+    "description": "Top apps by CPU, RAM and GPU",
+    "category": "System",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}

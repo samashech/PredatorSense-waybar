@@ -1,0 +1,11 @@
+{
+  "tooltip": "%1 is %2\n%3 days old · ate %4 GB of cache · petted %5 times",
+  "mood.chill": "chilling",
+  "mood.warm": "getting warm",
+  "mood.hot": "too hot! (CPU)",
+  "mood.dancing": "dancing to your music",
+  "mood.sleeping": "asleep",
+  "mood.tired": "tired (low battery)",
+  "mood.happy": "happy",
+  "mood.eating": "eating cache"
+}
