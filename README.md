@@ -20,7 +20,7 @@ cd PredatorSense-waybar
 
 ## Components
 
-### Fans
+## Fans
 - Auto, Max, or a fixed speed per fan, with live RPM
 - CPU and GPU temperature, without waking a sleeping NVIDIA GPU
 - Power profile switching; also works as a Waybar module or a plain CLI
